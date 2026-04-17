@@ -1,8 +1,8 @@
-#include <stdio.h>
+/* #include <stdio.h>
 #include <string.h>
 
 int safe_func() {
-    return 2 - 2;
+    return 2 + 1;
 }
 
 void vuln_func(char *input) {
@@ -22,10 +22,39 @@ int main() {
     }
 
     if (input[0] == 'A') {
-        return safe_func();
+        int y = safe_func();
+        if (y == 3){
+            return 0;
+        }
     } else {
         vuln_func(input);
     }
 
+    return 0;
+}
+*/
+
+#include <string.h>
+
+void inner(char *data) {
+    char buf[5];
+    strcpy(buf, data);  // уязвимость
+}
+
+void middle(char *data) {
+    inner(data);  // вызывает уязвимую
+}
+
+void outer() {
+    middle("exploit");  // вызывает middle
+}
+
+void safe() {
+    int x = 0;
+}
+
+int main() {
+    outer();
+    safe();
     return 0;
 }
