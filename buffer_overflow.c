@@ -34,27 +34,46 @@ int main() {
 }
 */
 
+// #include <string.h>
+
+// void inner(char *data) {
+//     char buf[5];
+//     strcpy(buf, data);  // уязвимость
+// }
+
+// void middle(char *data) {
+//     inner(data);  // вызывает уязвимую
+// }
+
+// void outer() {
+//     middle("exploit");  // вызывает middle
+// }
+
+// void safe() {
+//     int x = 0;
+// }
+
+// int main() {
+//     outer();
+//     safe();
+//     return 0;
+// }
+
+#include <stdio.h>
 #include <string.h>
 
-void inner(char *data) {
-    char buf[5];
-    strcpy(buf, data);  // уязвимость
-}
-
-void middle(char *data) {
-    inner(data);  // вызывает уязвимую
-}
-
-void outer() {
-    middle("exploit");  // вызывает middle
-}
-
-void safe() {
-    int x = 0;
+void trigger_vulnerability(char *input) {
+    char buf[8];
+    strcpy(buf, input);  // <-- уязвимость (buffer overflow)
 }
 
 int main() {
-    outer();
-    safe();
+    char input[128] = {0};
+    if (fgets(input, sizeof(input), stdin) == NULL) return 0;
+
+    if (input[0] != 'A') return 0;
+    if (input[1] != 'B') input[1] = 'C'; // ← этот блок
+
+    trigger_vulnerability(input);
     return 0;
 }

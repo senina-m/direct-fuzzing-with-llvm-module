@@ -1,0 +1,29 @@
+@startuml
+
+package {
+  [main] as main
+  [outer] as outer
+  [middle] as middle
+  [inner] as inner
+  [safe] as safe
+}
+
+' Normal calls
+main --> outer
+outer --> middle
+middle --> inner
+
+' Instrumented call
+main --> safe
+safe --> (exit) : call exit(0)
+
+' Note on instrumentation
+note right of safe
+  <b>Инструментирована</b>
+  Функция заменена на вызов
+  call exit(0).
+  Останавливает выполнение
+  этой ветки.
+end note
+
+@enduml
