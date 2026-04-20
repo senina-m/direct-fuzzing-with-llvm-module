@@ -1,0 +1,28 @@
+@startuml
+
+package {
+  [main] as main
+  [outer] as outer
+  [middle] as middle
+  [inner] as inner
+  [safe] as safe
+}
+
+main --> safe 
+main --> outer
+outer --> middle
+middle --> inner
+
+' Add a visual indicator for the crash/overflow point
+inner --> (strcpy) :  "  небезопасное копирование"
+
+' Vulnerable operation inside inner
+note right of inner
+  <b>Уязвимость</b>
+  Переполнение буфера
+  strcpy(buf, data)
+  buf size: 5 bytes
+  data size: 8 bytes
+end note
+
+@enduml

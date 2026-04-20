@@ -17,15 +17,11 @@ using namespace llvm;
 
 namespace
 {
-	struct VulnerabilityLocation
-	{
-		std::string function;
-		unsigned line;
-	};
 
+	// debug function
 	void dumpVulnerableBlocks(const std::set<BasicBlock *> &blocks, const Function &F)
 	{
-		errs() << "Vulnerable blocks in function " << F.getName() << ":\n";
+		errs() << "Vulnerable blocks in " << F.getName() << ":\n";
 		if (blocks.empty())
 		{
 			errs() << "  [none]\n";
@@ -34,11 +30,12 @@ namespace
 		for (BasicBlock *BB : blocks)
 		{
 			errs() << "  ";
-			BB->printAsOperand(errs(), false); // печатает имя, например %if.then
+			BB->printAsOperand(errs(), false);
 			errs() << "\n";
 		}
 	}
 
+	// debug function
 	void dumpVulnerableFunctions(const std::set<Function *> &vulnFuncs)
 	{
 		errs() << "Vulnerable functions:\n";
@@ -52,7 +49,6 @@ namespace
 			errs() << "  " << F->getName() << "\n";
 		}
 	}
-
 	struct VulnerablePathPass : public ModulePass
 	{
 		static char ID;
@@ -70,7 +66,6 @@ namespace
 			std::string currentFile;
 			while (std::getline(file, line))
 			{
-				// Пропускаем пустые строки и комментарии
 				if (line.empty() || line[0] == '#')
 					continue;
 
@@ -85,7 +80,7 @@ namespace
 				else if (line.rfind("function: ", 0) == 0)
 				{
 					std::string func = line.substr(10);
-					std::getline(file, line); // следующая строка — line
+					std::getline(file, line); // next line is "line: N"
 					if (line.rfind("line: ", 0) == 0)
 					{
 						unsigned ln = std::stoul(line.substr(6));
@@ -95,207 +90,136 @@ namespace
 			}
 		}
 
-		// Проверяет, содержит ли инструкция ПРЯМУЮ уязвимость
-		bool isDirectlyVulnerable(Instruction &I)
+		// Проверяет, есть ли функция в vulnerabilities.cfg
+		bool isFunctionVulnerable(Function *F)
 		{
-			// Получаем отладочную информацию
-			const DebugLoc &DL = I.getDebugLoc();
-			if (!DL)
-				return false;
-
-			// Получаем номер строки
-			unsigned line = DL.getLine();
-			if (line == 0)
-				return false;
-
-			// Получаем функцию, в которой находится инструкция
-			Function *F = I.getFunction();
 			if (!F)
 				return false;
 			StringRef funcName = F->getName();
-
-			// Получаем имя исходного файла
-			DILocation *Loc = DL.get();
-			if (!Loc)
-				return false;
-			std::string fileName = Loc->getFilename().str();
-
-			// Убираем путь, оставляем только имя файла (если нужно)
-			// Например: "/home/user/test.c" → "test.c"
-			size_t lastSlash = fileName.find_last_of("/\\");
-			if (lastSlash != std::string::npos)
+			for (const auto &fileEntry : ConfigVulns)
 			{
-				fileName = fileName.substr(lastSlash + 1);
-			}
-
-			// Проверяем конфигурацию
-			auto it = ConfigVulns.find(fileName);
-			if (it == ConfigVulns.end())
-				return false;
-
-			for (const auto &entry : it->second)
-			{
-				const std::string &cfgFunc = entry.first;
-				unsigned cfgLine = entry.second;
-				if (funcName == cfgFunc && line == cfgLine)
+				for (const auto &funcLine : fileEntry.second)
 				{
-					return true;
+					if (funcLine.first == funcName)
+					{
+						return true;
+					}
 				}
 			}
 			return false;
 		}
 
-		// Собирает уязвимые функции, ИСКЛЮЧАЯ main
-		std::set<Function *> collectVulnerableFunctions(Module &M)
+		// Находит все блоки, из которых достижим вызов уязвимой функции
+		std::set<BasicBlock *> findVulnerableBlocks(Function &F)
 		{
-			std::set<Function *> vulnFuncs;
-			for (Function &F : M)
-			{
-				if (F.isDeclaration())
-					continue;
-				if (F.getName() == "main")
-					continue; // ← КЛЮЧЕВОЕ: main не может быть "уязвимой функцией"
-				for (BasicBlock &BB : F)
-				{
-					for (Instruction &I : BB)
-					{
-						if (isDirectlyVulnerable(I))
-						{
-							vulnFuncs.insert(&F);
-							break;
-						}
-					}
-				}
-			}
-			return vulnFuncs;
-		}
+			std::set<BasicBlock *> vulnerableBlocks;
+			std::queue<BasicBlock *> worklist;
 
-
-		std::set<Function*> collectDirectlyVulnerableFunctions(Module &M)
-		{
-			std::set<Function *> vulnFuncs;
-			for (Function &F : M)
+			// Шаг 1: найти блоки с вызовами уязвимых функций
+			for (BasicBlock &BB : F)
 			{
-				if (F.isDeclaration())
-					continue;
-				for (BasicBlock &BB : F)
+				bool hasVulnCall = false;
+				for (Instruction &I : BB)
 				{
-					for (Instruction &I : BB)
+					if (CallInst *CI = dyn_cast<CallInst>(&I))
 					{
-						if (isDirectlyVulnerable(I))
+						if (Function *Callee = CI->getCalledFunction())
 						{
-							vulnFuncs.insert(&F);
-							break;
-						}
-					}
-				}
-			}
-			return vulnFuncs;
-		}
-
-		std::set<Function *> findTransitiveCallers(Module &M, const std::set<Function *> &directVulns)
-		{
-			// Сначала соберём прямые вызовы
-			std::unordered_map<Function *, std::set<Function *>> callers;
-			for (Function &F : M)
-			{
-				if (F.isDeclaration())
-					continue;
-				for (BasicBlock &BB : F)
-				{
-					for (Instruction &I : BB)
-					{
-						if (CallInst *CI = dyn_cast<CallInst>(&I))
-						{
-							if (Function *Callee = CI->getCalledFunction())
+							if (isFunctionVulnerable(Callee))
 							{
-								if (!Callee->isDeclaration())
-								{
-									callers[Callee].insert(&F);
-								}
+								hasVulnCall = true;
+								break;
 							}
 						}
 					}
 				}
+				if (hasVulnCall)
+				{
+					vulnerableBlocks.insert(&BB);
+					worklist.push(&BB);
+				}
 			}
 
-			// Обратный BFS от уязвимых функций
-			std::set<Function *> reachable;
-			std::queue<Function *> worklist;
-			for (Function *F : directVulns)
-			{
-				reachable.insert(F);
-				worklist.push(F);
-			}
-
+			// Шаг 2: обратный обход — всё, что ведёт К этим блокам
 			while (!worklist.empty())
 			{
-				Function *F = worklist.front();
+				BasicBlock *BB = worklist.front();
 				worklist.pop();
-				for (Function *Caller : callers[F])
+				for (BasicBlock *Pred : predecessors(BB))
 				{
-					if (reachable.insert(Caller).second)
+					if (vulnerableBlocks.insert(Pred).second)
 					{
-						worklist.push(Caller);
+						worklist.push(Pred);
 					}
 				}
 			}
 
-			return reachable;
+			return vulnerableBlocks;
 		}
 
-		void dumpVulnerableBlocks(const std::set<BasicBlock *> &blocks, const Function &F)
-		{
-			errs() << "Vulnerable blocks in " << F.getName() << ":\n";
-			for (BasicBlock *BB : blocks)
-			{
-				errs() << "  ";
-				BB->printAsOperand(errs(), false);
-				errs() << "\n";
-			}
-		}
 
 		bool runOnModule(Module &M) override
 		{
 			loadConfig("vulnerabilities.cfg");
 
-			auto directVulns = collectDirectlyVulnerableFunctions(M);
-			if (directVulns.empty())
+			// Проверим, что хотя бы одна уязвимая функция указана
+			bool hasVuln = false;
+			for (const auto &fileEntry : ConfigVulns)
 			{
-				errs() << "No directly vulnerable functions found\n";
+				if (!fileEntry.second.empty())
+				{
+					hasVuln = true;
+					break;
+				}
+			}
+			if (!hasVuln)
+			{
+				errs() << "No vulnerable functions found in vulnerabilities.cfg\n";
 				return false;
 			}
 
-			auto transitiveVulns = findTransitiveCallers(M, directVulns);
-
-			errs() << "Transitively vulnerable functions:\n";
-			for (Function *F : transitiveVulns)
-			{
-				errs() << "  " << F->getName() << "\n";
-			}
-
 			bool changed = false;
+
 			for (Function &F : M)
 			{
 				if (F.isDeclaration())
 					continue;
 
-				// Если функция ведёт к уязвимости — НЕ инструментируем
-				if (transitiveVulns.count(&F))
-				{
-					continue;
-				}
+				auto vulnerableBlocks = findVulnerableBlocks(F);
+				dumpVulnerableBlocks(vulnerableBlocks, F);
 
-				// Иначе — заменяем ВСЕ блоки на exit(0)
 				for (BasicBlock &BB : F)
 				{
+					if (vulnerableBlocks.count(&BB))
+					{
+						continue; // сохраняем
+					}
+
+					// Пропускаем блоки с return/unreachable
+					bool hasReturn = false;
+					for (Instruction &I : BB)
+					{
+						if (isa<ReturnInst>(&I) || isa<UnreachableInst>(&I))
+						{
+							hasReturn = true;
+							break;
+						}
+					}
+					if (hasReturn)
+						continue;
+
+					// Заменяем весь блок на exit(0)
 					BB.getInstList().clear();
 					IRBuilder<> Builder(&BB);
 					FunctionCallee ExitFn = M.getOrInsertFunction("exit",
 																  Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
 					Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
 					Builder.CreateUnreachable();
+
 					changed = true;
+					errs() << "Replaced block with exit(0): ";
+					BB.printAsOperand(errs());
+					errs() << " in " << F.getName() << "\n";
 				}
 			}
 
@@ -308,6 +232,6 @@ char VulnerablePathPass::ID = 0;
 
 static RegisterPass<VulnerablePathPass> X(
 	"vuln-path",
-	"Preserve only paths leading to vulnerabilities",
+	"Preserve only paths leading to vulnerabilities (block-level)",
 	false,
 	false);
