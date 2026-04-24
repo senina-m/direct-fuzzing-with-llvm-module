@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+*.ll
+out_init/*
+out/*
+afl-training
+afl-training/*
+
