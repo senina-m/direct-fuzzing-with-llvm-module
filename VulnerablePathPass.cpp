@@ -157,69 +157,49 @@ namespace
 			return vulnerableBlocks;
 		}
 
-
-		bool runOnModule(Module &M) override
-		{
+		bool runOnModule(Module &M) override {
 			loadConfig("vulnerabilities.cfg");
 
-			// Проверим, что хотя бы одна уязвимая функция указана
 			bool hasVuln = false;
-			for (const auto &fileEntry : ConfigVulns)
-			{
-				if (!fileEntry.second.empty())
-				{
+			for (const auto &fileEntry : ConfigVulns) {
+				if (!fileEntry.second.empty()) {
 					hasVuln = true;
 					break;
 				}
 			}
-			if (!hasVuln)
-			{
+			if (!hasVuln) {
 				errs() << "No vulnerable functions found in vulnerabilities.cfg\n";
 				return false;
 			}
 
 			bool changed = false;
 
-			for (Function &F : M)
-			{
-				if (F.isDeclaration())
-					continue;
+			for (Function &F : M) {
+				if (F.isDeclaration() || F.empty()) continue;
 
 				auto vulnerableBlocks = findVulnerableBlocks(F);
 				dumpVulnerableBlocks(vulnerableBlocks, F);
 
-				for (BasicBlock &BB : F)
-				{
-					if (vulnerableBlocks.count(&BB))
-					{
-						continue; // сохраняем
+				// Внутри цикла по блокам
+				for (BasicBlock &BB : F) {
+					if (vulnerableBlocks.count(&BB)) continue;
+					if (isa<UnreachableInst>(BB.getTerminator())) continue;
+
+					// Находим позицию для вставки: ПОСЛЕ всех PHI-нод
+					Instruction *InsertPos = &*BB.getFirstNonPHI();
+					
+					// Если блок состоит ТОЛЬКО из PHI-нод — вставляем в конец
+					if (InsertPos == BB.getTerminator()) {
+						InsertPos = BB.getTerminator();
 					}
 
-					// Пропускаем блоки с return/unreachable
-					bool hasReturn = false;
-					for (Instruction &I : BB)
-					{
-						if (isa<ReturnInst>(&I) || isa<UnreachableInst>(&I))
-						{
-							hasReturn = true;
-							break;
-						}
-					}
-					if (hasReturn)
-						continue;
-
-					// Заменяем весь блок на exit(0)
-					BB.getInstList().clear();
-					IRBuilder<> Builder(&BB);
+					IRBuilder<> Builder(InsertPos);
 					FunctionCallee ExitFn = M.getOrInsertFunction("exit",
-																  Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
+						Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
 					Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
-					Builder.CreateUnreachable();
 
 					changed = true;
-					errs() << "Replaced block with exit(0): ";
-					BB.printAsOperand(errs());
-					errs() << " in " << F.getName() << "\n";
+					errs() << "Inserted exit(0) after PHIs in " << F.getName() << "\n";
 				}
 			}
 

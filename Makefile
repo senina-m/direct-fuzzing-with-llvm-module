@@ -4,6 +4,7 @@ CLANG       ?= clang
 OPT         ?= opt
 AFL_CC      ?= afl-cc
 PYTHON      ?= python3
+CXX			= clang++
 
 CFLAGS_LLVM = -O0 -g -fno-discard-value-names
 CFLAGS_BIN  = -O0 -g
