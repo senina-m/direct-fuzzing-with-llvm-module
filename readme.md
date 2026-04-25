@@ -34,7 +34,7 @@ opt -load ../llvm/VulnPathPass.so -vuln-path libxml2_fuzz.ll -o instrumented.ll 
 
 afl-cc -O0 -g -fno-pie -no-pie instrumented.ll -lpthread -lz -lm -ldl -o fuzz_target
 
-afl-fuzz -i ../llvm/seeds/ -o out -- /fuzz-target
+afl-fuzz -i ../llvm/seeds/ -o out -- ./fuzz_target
 
 cp fuzz_target ../llvm/
 ```
