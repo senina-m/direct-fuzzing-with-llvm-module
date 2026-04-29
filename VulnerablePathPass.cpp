@@ -96,12 +96,6 @@ namespace
         std::map<Function*, std::set<BasicBlock*>> BlocksToWipeOut; 
     };
 
-    enum class FuncRole {
-        STACK_FUNC,   // Лежит на пути к уязвимости, имеет критический вызов дальше
-        HELPER_FUNC,  // Вызывается на пути, но сама не ведет дальше к уязвимости (или leaf)
-        UNKNOWN       // Не в кластере
-    };
-
 	struct VulnerablePathPass : public ModulePass
 	{
 		static char ID;
@@ -197,6 +191,7 @@ namespace
                                 const DebugLoc &DL = I.getDebugLoc();
                                 if (DL && DL.getLine() == cfgLine) {
                                     DirectlyVulnerableBlocksMap[&F].insert(&BB);
+                                    errs() << "[VULN] Found in " << funcName << " block " << BB.getName() << "\n";
                                 }
                             }
                         }
@@ -205,11 +200,20 @@ namespace
             }
         }
 
-        void preserveFunctionsByName(Module &M, std::set<Function*> &cluster, const std::string &nameSubstring) {
-            for (Function &F : M) {
-                if (F.isDeclaration()) continue;
-                if (F.getName().contains(nameSubstring)) {
-                    cluster.insert(&F);
+        // Принудительно добавляет функции с точным совпадением имени в набор HelperFunctions
+        void preserveSpecificFunctions(Module &M, std::queue<Function*> &funcQueue, std::set<Function*> &funcSet, const std::vector<std::string> &funcNames, const std::string &funcSetName) {
+            for (const std::string &name : funcNames) {
+                Function *F = M.getFunction(name);
+                if (F && !F->isDeclaration()) {
+                    if (funcSet.insert(F).second) {
+                        funcQueue.push(F);
+                        errs() << "[FORCE-ADD] Added '" << name 
+                            << "' to queue " << funcSetName << " because it was manually requested.\n";
+                    } else {
+                        errs() << "[FORCE-ADD] '" << name << "' is already in the set " << funcSetName << " .\n";
+                    }
+                } else {
+                    errs() << "[FORCE-ADD] Function '" << name << "' not found or is declaration.\n";
                 }
             }
         }
@@ -255,8 +259,10 @@ namespace
 
         InstrumentationPlan buildInstrumentationPlan(Module &M) {
             InstrumentationPlan plan;
-            std::set<Function*> preservedCluster; 
             
+            std::set<Function*> StackFunctions;
+            std::set<Function*> HelperFunctions;
+
             // 1. Строим граф вызовов
             std::unordered_map<Function*, std::set<Function*>> callersMap;
             std::unordered_map<Function*, std::set<Function*>> calleesMap;
@@ -277,134 +283,141 @@ namespace
                 }
             }
 
-            // 2. Инициализируем кластер от уязвимых функций
-            std::queue<Function*> q;
+            // 2. Построение STACK FUNCTIONS (Backward Search от уязвимости)
+            // Это строгий путь вызовов К уязвимости.
+            std::queue<Function*> stackQueue;
             for (auto &Pair : DirectlyVulnerableBlocksMap) {
-                if (preservedCluster.insert(Pair.first).second) q.push(Pair.first);
+                Function *F = Pair.first;
+                if (StackFunctions.insert(F).second) {
+                    stackQueue.push(F);
+                    errs() << "[STACK-INIT] Added vulnerable function: " << F->getName() << "\n";
+                }
             }
-            
-            // Добавляем принудительно сохраненные по имени
-            preserveFunctionsByName(M, preservedCluster, "xmlMemRead");
 
-            // BFS для полного кластера
-            while (!q.empty()) {
-                Function *Curr = q.front(); q.pop();
-                // Backward
+            while (!stackQueue.empty()) {
+                Function *Curr = stackQueue.front(); stackQueue.pop();
+                
+                // Идем только НАЗАД (кто вызывает Curr?)
                 if (callersMap.count(Curr)) {
                     for (Function *Caller : callersMap[Curr]) {
-                        if (preservedCluster.insert(Caller).second) q.push(Caller);
-                    }
-                }
-                // Forward
-                if (calleesMap.count(Curr)) {
-                    for (Function *Callee : calleesMap[Curr]) {
-                        if (preservedCluster.insert(Callee).second) q.push(Callee);
+                        if (StackFunctions.insert(Caller).second) {
+                            stackQueue.push(Caller);
+                            errs() << "[STACK-BACK] Added caller: " << Caller->getName() << " -> " << Curr->getName() << "\n";
+                        }
                     }
                 }
             }
 
-            // 3. Определяем роли функций и Critical Calls
-            // Stack Function: та, у которой есть вызов функции из кластера, которая "ближе" к уязвимости.
-            // Для простоты: если F вызывает G, и G в кластере, то вызов G в F - критический.
+            // 3. Построение HELPER FUNCTIONS (Forward Search от стека)
+            // Это функции, которые вызываются из стека, но не являются его частью.
+            std::queue<Function*> helperQueue;
             
-            std::map<Function*, Instruction*> CriticalCallMap; // Func -> CallInst leading deeper
-            
-            // Чтобы определить "глубину", можно использовать расстояние от уязвимости.
-            // Но для начала просто пометим: если функция вызывает кого-то из кластера, она Stack.
-            // Исключение: если она сама уязвима, она тоже Stack (цель - сам уязвимый блок).
-            
-            std::set<Function*> StackFunctions;
-            std::set<Function*> HelperFunctions;
+            // Инициализируем очередь всеми функциями стека
+            for (Function *F : StackFunctions) {
+                helperQueue.push(F);
+            }
+            preserveSpecificFunctions(M, helperQueue, HelperFunctions, {"xmlInitParserInternal", "xmlPosixStrdup", "xmlMemRead", "xmlSAX2SetDocumentLocator"}, "Helper");
 
-            for (Function *F : preservedCluster) {
-                bool isStack = false;
+            while (!helperQueue.empty()) {
+                Function *Curr = helperQueue.front(); helperQueue.pop();
                 
-                // Проверка: вызывает ли она кого-то из кластера?
-                if (calleesMap.count(F)) {
+                // Идем ВПЕРЕД (кого вызывает Curr?)
+                if (calleesMap.count(Curr)) {
+                    for (Function *Callee : calleesMap[Curr]) {
+                        // Если вызываемая функция УЖЕ в стеке, она не хелпер, пропускаем
+                        if (StackFunctions.count(Callee)) continue;
+                        
+                        // Если вызываемая функция еще не известна как хелпер, добавляем
+                        if (HelperFunctions.insert(Callee).second) {
+                            helperQueue.push(Callee);
+                            errs() << "[HELPER-FWD] Added helper: " << Callee->getName() << " (called by " << Curr->getName() << ")\n";
+                        }
+                    }
+                }
+            }
+
+            // 4. Формирование плана инструментации
+            
+            // --- Обработка STACK функций ---
+            for (Function *F : StackFunctions) {
+                if (F->isDeclaration() || F->empty()) continue;
+
+                Instruction *Target = nullptr;
+
+                // Приоритет 1: Если функция сама содержит уязвимость, цель - уязвимый блок
+                if (DirectlyVulnerableBlocksMap.count(F)) {
+                    if (!DirectlyVulnerableBlocksMap[F].empty()) {
+                        BasicBlock *VulnBB = *DirectlyVulnerableBlocksMap[F].begin();
+                        if (!VulnBB->empty()) {
+                            Target = &*VulnBB->begin();
+                            errs() << "[PLAN-STACK] " << F->getName() << " is VULNERABLE. Target: Block " << VulnBB->getName() << "\n";
+                        }
+                    }
+                }
+                
+                // Приоритет 2: Если уязвимости нет, ищем вызов следующей функции ИЗ СТЕКА
+                if (!Target && calleesMap.count(F)) {
                     for (Function *Callee : calleesMap[F]) {
-                        if (preservedCluster.count(Callee)) {
-                            // Нашли первый попавшийся вызов в кластер. 
-                            // В идеале нужно выбирать тот, что ведет к уязвимости, но в связном графе кластера
-                            // любой вызов внутрь кластера (кроме циклов) обычно ведет к цели.
-                            // Возьмем первый найденный CallInst для этого Callee.
+                        if (StackFunctions.count(Callee)) {
+                            // Нашли вызов функции, которая тоже лежит на пути к уязвимости
+                            // Ищем конкретную инструкцию вызова
                             for (BasicBlock &BB : *F) {
                                 for (Instruction &I : BB) {
                                     if (CallInst *CI = dyn_cast<CallInst>(&I)) {
                                         if (CI->getCalledFunction() == Callee) {
-                                            CriticalCallMap[F] = CI;
-                                            isStack = true;
+                                            Target = CI;
+                                            errs() << "[PLAN-STACK] " << F->getName() << " calls next stack func: " << Callee->getName() << "\n";
                                             break;
                                         }
                                     }
                                 }
-                                if (isStack) break;
+                                if (Target) break;
                             }
                         }
-                        if (isStack) break;
+                        if (Target) break;
                     }
                 }
 
-                // Если функция сама содержит уязвимость, она тоже Stack (цель - уязвимый блок)
-                if (DirectlyVulnerableBlocksMap.count(F)) {
-                    isStack = true;
-                    // Для уязвимой функции целью является первая инструкция уязвимого блока
-                    if (!DirectlyVulnerableBlocksMap[F].empty()) {
-                        BasicBlock *VulnBB = *DirectlyVulnerableBlocksMap[F].begin();
-                        if (!VulnBB->empty()) {
-                            CriticalCallMap[F] = &*VulnBB->begin();
-                        }
+                if (Target) {
+                    std::set<Instruction*> Targets = {Target};
+                    std::set<BasicBlock*> NonLeadingBlocks = findBlocksNotLeadingToTargets(F, Targets);
+                    
+                    for (BasicBlock *BB : NonLeadingBlocks) {
+                        // Для стековых функций инструментируем любые блоки, не ведущие к цели
+                        // (так как они являются тупиковыми ветками, прерывающими путь к уязвимости)
+                        plan.BlocksToWipeOut[F].insert(BB);
+                        printBlockTerminationTree(BB, "Stack Func: block does not lead to critical target");
                     }
-                }
-
-                if (isStack) {
-                    StackFunctions.insert(F);
-                    errs() << "[" << F->getName() << "] " <<  "Stask function" << "\n";
                 } else {
-                    HelperFunctions.insert(F);
-                    errs() << "[" << F->getName() << "] " << "Helper function" << "\n";
+                    errs() << "[PLAN-STACK] " << F->getName() << " has no clear target. Preserving entirely.\n";
                 }
             }
 
-            // 4. Формируем план инструментации блоков
-            for (Function *F : preservedCluster) {
+            // --- Обработка HELPER функций ---
+            for (Function *F : HelperFunctions) {
                 if (F->isDeclaration() || F->empty()) continue;
-
-                if (StackFunctions.count(F)) {
-                    // --- ЛОГИКА ДЛЯ STACK FUNCTION ---
-                    // Ищем блоки, не ведущие к Critical Call
-                    Instruction *Target = CriticalCallMap[F];
-                    if (Target) {
-                        std::set<Instruction*> Targets = {Target};
-                        std::set<BasicBlock*> NonLeadingBlocks = findBlocksNotLeadingToTargets(F, Targets);
-                        
-                        for (BasicBlock *BB : NonLeadingBlocks) {
-                            // errs() << "[&&&&&] " << BB->getName() << "' NonLeadingBlocks " << "\n";
-                            // Инструментируем только если блок завершается return или exit
-                            // if (isTerminatingBlock(BB, true)) { // true = check return
-                                plan.BlocksToWipeOut[F].insert(BB);
-                                printBlockTerminationTree(BB, "Stack Func: block does not lead to critical call and has return/exit");
-                            // }
-                        }
-                    }
-                } else if (HelperFunctions.count(F)) {
-                    // --- ЛОГИКА ДЛЯ HELPER FUNCTION ---
-                    // Инструментируем только блоки с exit/abort
-                    for (BasicBlock &BB : *F) {
-                        if (isTerminatingBlock(&BB, false)) { // false = ignore return, check only exit/abort
-                            plan.BlocksToWipeOut[F].insert(&BB);
-                            printBlockTerminationTree(&BB, "Helper Func: block contains exit/abort");
-                        }
+                
+                // Для хелперов инструментируем ТОЛЬКО блоки с exit/abort
+                for (BasicBlock &BB : *F) {
+                    if (isTerminatingBlock(&BB, false)) { // false = ignore return
+                        plan.BlocksToWipeOut[F].insert(&BB);
+                        printBlockTerminationTree(&BB, "Helper Func: block contains exit/abort");
                     }
                 }
             }
 
-            // Функции вне кластера глушим целиком
+            // --- Обработка остальных функций (Wipe Out) ---
             for (Function &F : M) {
                 if (F.isDeclaration() || F.empty()) continue;
-                if (preservedCluster.count(&F) == 0) {
+                if (StackFunctions.count(&F) == 0 && HelperFunctions.count(&F) == 0) {
                     plan.FunctionsToWipeOut.insert(&F);
+                    // errs() << "[PLAN-WIPE] Function outside cluster: " << F.getName() << "\n";
                 }
             }
+
+            errs() << "[SUMMARY] Stack Functions: " << StackFunctions.size() 
+                   << ", Helper Functions: " << HelperFunctions.size() 
+                   << ", Wiped Functions: " << plan.FunctionsToWipeOut.size() << "\n";
 
             return plan;
         }
@@ -423,7 +436,7 @@ namespace
             errs() << "\n--- EXECUTING PLAN ---\n";
 			bool changed = false;
             
-            // 1. Глушим функции целиком
+            // 1. Инструментируем функции целиком
             for (Function *F : plan.FunctionsToWipeOut) {
                 errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
                 for (BasicBlock &BB : *F) {
@@ -437,7 +450,7 @@ namespace
                 }
             }
 
-            // 2. Глушим конкретные блоки
+            // 2. Инструментируем конкретные блоки
             for (auto &Entry : plan.BlocksToWipeOut) {
                 Function *F = Entry.first;
                 std::set<BasicBlock*> &Blocks = Entry.second;
