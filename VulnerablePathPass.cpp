@@ -7,67 +7,122 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
-#include <string>
 #include <queue>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <map>
 
 using namespace llvm;
 
 namespace
 {
-	void dumpVulnerableBlocks(const std::set<BasicBlock *> &blocks, const Function &F)
-	{
-		errs() << "Vulnerable blocks in function " << F.getName() << ":\n";
-		if (blocks.empty())
-		{
-			errs() << "  [none]\n";
-			return;
-		}
-		for (BasicBlock *BB : blocks)
-		{
-			errs() << "  ";
-			BB->printAsOperand(errs(), false); // печатает имя, например %if.then
-			errs() << "\n";
-		}
-	}
+    std::string escapeDotString(const std::string &s) {
+        std::string result = s;
+        size_t pos = 0;
+        while ((pos = result.find("\"", pos)) != std::string::npos) {
+            result.replace(pos, 1, "\\\"");
+            pos += 2;
+        }
+        return "\"" + result + "\"";
+    }
 
-	void dumpVulnerableFunctions(const std::set<Function *> &vulnFuncs)
-	{
-		errs() << "Dump functions list:\n";
-		if (vulnFuncs.empty())
-		{
-			errs() << "  [none]\n";
-			return;
-		}
-		for (Function *F : vulnFuncs)
-		{
-			errs() << "  " << F->getName() << "\n";
-		}
-	}
+    // Helper: Получает номер строки для первой инструкции блока
+    unsigned getBlockLineNumber(BasicBlock *BB) {
+        for (Instruction &I : *BB) {
+            const DebugLoc &DL = I.getDebugLoc();
+            if (DL) return DL.getLine();
+        }
+        return 0;
+    }
+
+    // Helper: Проверяет, является ли блок завершающим выполнение процесса или функции
+    bool isTerminatingBlock(BasicBlock *BB, bool checkReturn) {
+        Instruction *Term = BB->getTerminator();
+        if (checkReturn && isa<ReturnInst>(Term)) return true;
+        
+        for (Instruction &I : *BB) {
+            if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                if (Function *F = CI->getCalledFunction()) {
+                    StringRef Name = F->getName();
+                    if (Name == "exit" || Name == "_exit" || Name == "abort") return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Печатает дерево путей от блока к терминалам
+    void printBlockTerminationTree(BasicBlock *StartBB, const std::string &reason) {
+        unsigned line = getBlockLineNumber(StartBB);
+        std::string lineStr = (line > 0) ? std::to_string(line) : "?";
+        
+        errs() << "\n[DEBUG-TREE] Block '" << StartBB->getName() << "' (line:" << lineStr 
+               << ") in func '" << StartBB->getParent()->getName() << "' INSTRUMENTED because: " << reason << "\n";
+        
+        // Простой вывод первых шагов вперед
+        std::queue<std::pair<BasicBlock*, int>> q;
+        std::set<BasicBlock*> visited;
+        q.push({StartBB, 0});
+        visited.insert(StartBB);
+
+        while (!q.empty()) {
+            auto [Current, depth] = q.front(); q.pop();
+            std::string indent(depth * 2, ' ');
+            
+            unsigned cLine = getBlockLineNumber(Current);
+            std::string cLineStr = (cLine > 0) ? std::to_string(cLine) : "?";
+            
+            errs() << indent << "Block: " << Current->getName() << " (line:" << cLineStr << ")";
+            if (isTerminatingBlock(Current, true)) errs() << " [RETURN/EXIT]";
+            errs() << "\n";
+
+            if (depth < 3) { // Ограничиваем глубину вывода
+                for (auto Succ : successors(Current)) {
+                    if (visited.insert(Succ).second) {
+                        q.push({Succ, depth + 1});
+                    }
+                }
+            }
+        }
+        errs() << "[DEBUG-TREE] End.\n\n";
+    }
+
+    struct InstrumentationPlan {
+        std::set<Function*> FunctionsToWipeOut; 
+        std::map<Function*, std::set<BasicBlock*>> BlocksToWipeOut; 
+    };
+
+    enum class FuncRole {
+        STACK_FUNC,   // Лежит на пути к уязвимости, имеет критический вызов дальше
+        HELPER_FUNC,  // Вызывается на пути, но сама не ведет дальше к уязвимости (или leaf)
+        UNKNOWN       // Не в кластере
+    };
 
 	struct VulnerablePathPass : public ModulePass
 	{
 		static char ID;
 		std::unordered_map<std::string, std::vector<std::pair<std::string, unsigned>>> ConfigVulns;
+        std::map<Function*, std::set<BasicBlock*>> DirectlyVulnerableBlocksMap;
 
 		VulnerablePathPass() : ModulePass(ID) {}
 
 		void loadConfig(const std::string &configPath)
 		{
 			std::ifstream file(configPath);
-			if (!file.is_open())
-				return;
+			if (!file.is_open()) {
+                errs() << "[CONFIG] Warning: Could not open vulnerabilities.cfg\n";
+                return;
+            }
 
 			std::string line;
 			std::string currentFile;
 			while (std::getline(file, line))
 			{
-				// Пропускаем пустые строки и комментарии
-				if (line.empty() || line[0] == '#')
-					continue;
+				if (line.empty() || line[0] == '#') continue;
 
 				if (line.rfind("[file: ", 0) == 0)
 				{
@@ -80,318 +135,332 @@ namespace
 				else if (line.rfind("function: ", 0) == 0)
 				{
 					std::string func = line.substr(10);
-					std::getline(file, line); // следующая строка — line
-					if (line.rfind("line: ", 0) == 0)
-					{
-						unsigned ln = std::stoul(line.substr(6));
-						ConfigVulns[currentFile].emplace_back(func, ln);
-					}
-				}
-			}
-		}
-
-		// Проверяет, содержит ли инструкция ПРЯМУЮ уязвимость
-		bool isDirectlyVulnerable(Instruction &I)
-		{
-			// Получаем отладочную информацию
-			const DebugLoc &DL = I.getDebugLoc();
-			if (!DL)
-				return false;
-
-			// Получаем номер строки
-			unsigned line = DL.getLine();
-			if (line == 0)
-				return false;
-
-			// Получаем функцию, в которой находится инструкция
-			Function *F = I.getFunction();
-			if (!F)
-				return false;
-			StringRef funcName = F->getName();
-
-			// Получаем имя исходного файла
-			DILocation *Loc = DL.get();
-			if (!Loc)
-				return false;
-			std::string fileName = Loc->getFilename().str();
-
-			// Убираем путь, оставляем только имя файла (если нужно)
-			// Например: "/home/user/test.c" → "test.c"
-			size_t lastSlash = fileName.find_last_of("/\\");
-			if (lastSlash != std::string::npos)
-			{
-				fileName = fileName.substr(lastSlash + 1);
-			}
-
-			// Проверяем конфигурацию
-			auto it = ConfigVulns.find(fileName);
-			if (it == ConfigVulns.end())
-				return false;
-
-			for (const auto &entry : it->second)
-			{
-				const std::string &cfgFunc = entry.first;
-				unsigned cfgLine = entry.second;
-				if (funcName == cfgFunc && line == cfgLine)
-				{
-					return true;
-				}
-			}
-			return false;
-		}
-
-		std::set<Instruction*> findVulnerableInstructions(Module &M) {
-			// errs() << " find vulnurable instructions ------------- " << "\n";
-			std::set<Instruction*> result;
-			for (Function &F : M) {
-				// errs() << "  " << F.getName() << "\n";
-				if (F.isDeclaration()) continue;
-				for (BasicBlock &BB : F) {
-					for (Instruction &I : BB) {
-						if (isDirectlyVulnerable(I)) {
-							result.insert(&I);
-							// errs() << "has vulnurable -> " << F.getName() << "\n";
-
+					if (std::getline(file, line)) {
+						if (line.rfind("line: ", 0) == 0)
+						{
+                            const char* start = line.c_str() + 6;
+                            char* endptr = nullptr;
+                            unsigned long ln = std::strtoul(start, &endptr, 10);
+                            
+                            if (endptr != start && (*endptr == '\0' || *endptr == '\n' || *endptr == '\r')) {
+                                ConfigVulns[currentFile].emplace_back(func, static_cast<unsigned>(ln));
+                            }
 						}
 					}
 				}
 			}
-			// errs() << " --------------------------------------- " << "\n";
-			return result;
+            errs() << "[CONFIG] Loaded config.\n";
 		}
 
-		std::set<Function*> findFullPreserveSet(Module &M, const std::set<Instruction*> &vulnInstrs) {
-			std::set<Function*> preserve;
+        void findVulnerableFunctionsAndBlocks(Module &M) {
+            DirectlyVulnerableBlocksMap.clear();
+            
+            for (Function &F : M) {
+                if (F.isDeclaration()) continue;
 
-			// --- Forward: всё, что вызывается из уязвимых функций ---
-			std::queue<Function*> forwardQ;
-			for (Instruction *I : vulnInstrs) {
-				Function *F = I->getFunction();
-				if (preserve.insert(F).second) {
-					forwardQ.push(F);
-				}
-			}
-			while (!forwardQ.empty()) {
-				Function *F = forwardQ.front(); forwardQ.pop();
-				for (BasicBlock &BB : *F) {
-					for (Instruction &I : BB) {
-						if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-							if (Function *Callee = CI->getCalledFunction()) {
-								// errs() << F->getName() << "  is called from vulnurable" << "\n";
-								if (Callee && !Callee->isDeclaration()) {
-									if (preserve.insert(Callee).second) {
-										forwardQ.push(Callee);
-									}
-								}
-							}
-						}
-					}
-				}
-			}
+                std::string fileName = "";
+                bool foundDebugInfo = false;
 
-			// --- Backward: всё, что вызывает уязвимые функции ---
-			std::unordered_map<Function*, std::set<Function*>> callers;
-			for (Function &F : M) {
-				if (F.isDeclaration()) continue;
-				for (BasicBlock &BB : F) {
-					for (Instruction &I : BB) {
-						if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-							if (Function *Callee = CI->getCalledFunction()) {
-								if (Callee && !Callee->isDeclaration()) {
-									callers[Callee].insert(&F);
-								}
-							}
-						}
-					}
-				}
-			}
+                for (BasicBlock &BB : F) {
+                    for (Instruction &I : BB) {
+                        const DebugLoc &DL = I.getDebugLoc();
+                        if (DL) {
+                            DILocation *Loc = DL.get();
+                            if (Loc) {
+                                fileName = Loc->getFilename().str();
+                                size_t lastSlash = fileName.find_last_of("/\\");
+                                if (lastSlash != std::string::npos) {
+                                    fileName = fileName.substr(lastSlash + 1);
+                                }
+                                foundDebugInfo = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (foundDebugInfo) break;
+                }
 
-			std::queue<Function*> backwardQ;
-			for (Function *F : preserve) {
-				backwardQ.push(F);
-			}
-			while (!backwardQ.empty()) {
-				Function *F = backwardQ.front(); backwardQ.pop();
-				auto it = callers.find(F);
-				if (it != callers.end()) {
-					for (Function *Caller : it->second) {
-						if (preserve.insert(Caller).second) {
-							backwardQ.push(Caller);
-						}
-					}
-				}
-			}
+                if (fileName.empty()) continue;
 
-			return preserve;
-		}
+                auto itFile = ConfigVulns.find(fileName);
+                if (itFile == ConfigVulns.end()) continue;
 
-		std::set<BasicBlock*> findRelevantBlocksInFunction(
-			Function &F,
-			const std::set<Instruction*> &vulnInstrs,
-			const std::set<Function*> &preserveFuncs) {
+                StringRef funcName = F.getName();
+                
+                for (const auto &entry : itFile->second) {
+                    const std::string &cfgFunc = entry.first;
+                    unsigned cfgLine = entry.second;
 
-			std::set<BasicBlock*> relevant;
-			std::queue<BasicBlock*> worklist;
-			errs() << F.getName() << "\n";
+                    if (funcName == cfgFunc) {
+                        for (BasicBlock &BB : F) {
+                            for (Instruction &I : BB) {
+                                const DebugLoc &DL = I.getDebugLoc();
+                                if (DL && DL.getLine() == cfgLine) {
+                                    DirectlyVulnerableBlocksMap[&F].insert(&BB);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-			// --- Шаг 1: начальные блоки ---
-			for (BasicBlock &BB : F) {
-				bool isStart = false;
+        void preserveFunctionsByName(Module &M, std::set<Function*> &cluster, const std::string &nameSubstring) {
+            for (Function &F : M) {
+                if (F.isDeclaration()) continue;
+                if (F.getName().contains(nameSubstring)) {
+                    cluster.insert(&F);
+                }
+            }
+        }
 
-				// 1a. Содержит уязвимую инструкцию?
-				for (Instruction &I : BB) {
-					if (vulnInstrs.count(&I)) {
-						isStart = true;
-						break;
-					}
-				}
+        // Находит блоки, которые НЕ ведут к TargetInsts
+        std::set<BasicBlock*> findBlocksNotLeadingToTargets(Function *F, const std::set<Instruction*> &TargetInsts) {
+            std::set<BasicBlock*> blocksLeadingToTarget;
+            std::set<BasicBlock*> targetBlocks;
+            
+            for (Instruction *I : TargetInsts) {
+                if (I->getParent()->getParent() == F) {
+                    targetBlocks.insert(I->getParent());
+                }
+            }
 
-				// 1b. Вызывает сохраняемую функцию?
-				if (!isStart) {
-					for (Instruction &I : BB) {
-						if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-							if (Function *Callee = CI->getCalledFunction()) {
-								if (preserveFuncs.count(Callee)) {
-									isStart = true;
-									break;
-								}
-							}
-						}
-					}
-				}
+            std::queue<BasicBlock*> worklist;
+            std::set<BasicBlock*> visited;
 
-				if (isStart) {
-					relevant.insert(&BB);
-					worklist.push(&BB);
-				}
-			}
+            for (BasicBlock *TB : targetBlocks) {
+                worklist.push(TB);
+                visited.insert(TB);
+                blocksLeadingToTarget.insert(TB);
+            }
 
-			// --- Шаг 2: обратный обход, но НЕ заходим в блоки с return/exit ---
-			while (!worklist.empty()) {
-				BasicBlock *BB = worklist.front();
-				worklist.pop();
+            while (!worklist.empty()) {
+                BasicBlock *Current = worklist.front(); worklist.pop();
+                for (auto Pred : predecessors(Current)) {
+                    if (visited.insert(Pred).second) {
+                        blocksLeadingToTarget.insert(Pred);
+                        worklist.push(Pred);
+                    }
+                }
+            }
 
-				// Не идём дальше, если блок завершается return/unreachable
-				Instruction *TI = BB->getTerminator();
-				if (TI && (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI))) {
-					continue;
-				}
+            std::set<BasicBlock*> result;
+            for (BasicBlock &BB : *F) {
+                if (blocksLeadingToTarget.count(&BB) == 0) {
+                    result.insert(&BB);
+                }
+            }
+            return result;
+        }
 
-				for (BasicBlock *Pred : predecessors(BB)) {
-					// Также не добавляем предшественников, если они сами терминальные
-					Instruction *PTI = Pred->getTerminator();
-					if (PTI && (isa<ReturnInst>(PTI) || isa<UnreachableInst>(PTI))) {
-						continue;
-					}
-					errs() << "pred" << "\n";
-					
-					if (relevant.insert(Pred).second) {
-						worklist.push(Pred);
-					}
-				}
-			}
+        InstrumentationPlan buildInstrumentationPlan(Module &M) {
+            InstrumentationPlan plan;
+            std::set<Function*> preservedCluster; 
+            
+            // 1. Строим граф вызовов
+            std::unordered_map<Function*, std::set<Function*>> callersMap;
+            std::unordered_map<Function*, std::set<Function*>> calleesMap;
 
-			return relevant;
-		}
+            for (Function &F : M) {
+                if (F.isDeclaration()) continue;
+                for (BasicBlock &BB : F) {
+                    for (Instruction &I : BB) {
+                        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                            if (Function *Callee = CI->getCalledFunction()) {
+                                if (!Callee->isDeclaration()) {
+                                    callersMap[Callee].insert(&F);
+                                    calleesMap[&F].insert(Callee);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-		// Собираем все функции, вызываемые из preserveFuncs
-		std::set<Function*> findFunctionsCalledFromPreserved(
-			Module &M,
-			const std::set<Function*> &preserveFuncs) {
-			
-			std::set<Function*> calledFromPreserved;
+            // 2. Инициализируем кластер от уязвимых функций
+            std::queue<Function*> q;
+            for (auto &Pair : DirectlyVulnerableBlocksMap) {
+                if (preservedCluster.insert(Pair.first).second) q.push(Pair.first);
+            }
+            
+            // Добавляем принудительно сохраненные по имени
+            preserveFunctionsByName(M, preservedCluster, "xmlMemRead");
 
-			for (Function *F : preserveFuncs) {
-				// Пропускаем объявления (должны быть определены)
-				if (!F || F->isDeclaration()) continue;
+            // BFS для полного кластера
+            while (!q.empty()) {
+                Function *Curr = q.front(); q.pop();
+                // Backward
+                if (callersMap.count(Curr)) {
+                    for (Function *Caller : callersMap[Curr]) {
+                        if (preservedCluster.insert(Caller).second) q.push(Caller);
+                    }
+                }
+                // Forward
+                if (calleesMap.count(Curr)) {
+                    for (Function *Callee : calleesMap[Curr]) {
+                        if (preservedCluster.insert(Callee).second) q.push(Callee);
+                    }
+                }
+            }
 
-				for (BasicBlock &BB : *F) {
-					for (Instruction &I : BB) {
-						if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-							if (Function *Callee = CI->getCalledFunction()) {
-								if (Callee && !Callee->isDeclaration()) {
-									calledFromPreserved.insert(Callee);
-								}
-							}
-						}
-					}
-				}
-			}
+            // 3. Определяем роли функций и Critical Calls
+            // Stack Function: та, у которой есть вызов функции из кластера, которая "ближе" к уязвимости.
+            // Для простоты: если F вызывает G, и G в кластере, то вызов G в F - критический.
+            
+            std::map<Function*, Instruction*> CriticalCallMap; // Func -> CallInst leading deeper
+            
+            // Чтобы определить "глубину", можно использовать расстояние от уязвимости.
+            // Но для начала просто пометим: если функция вызывает кого-то из кластера, она Stack.
+            // Исключение: если она сама уязвима, она тоже Stack (цель - сам уязвимый блок).
+            
+            std::set<Function*> StackFunctions;
+            std::set<Function*> HelperFunctions;
 
-			return calledFromPreserved;
-		}
+            for (Function *F : preservedCluster) {
+                bool isStack = false;
+                
+                // Проверка: вызывает ли она кого-то из кластера?
+                if (calleesMap.count(F)) {
+                    for (Function *Callee : calleesMap[F]) {
+                        if (preservedCluster.count(Callee)) {
+                            // Нашли первый попавшийся вызов в кластер. 
+                            // В идеале нужно выбирать тот, что ведет к уязвимости, но в связном графе кластера
+                            // любой вызов внутрь кластера (кроме циклов) обычно ведет к цели.
+                            // Возьмем первый найденный CallInst для этого Callee.
+                            for (BasicBlock &BB : *F) {
+                                for (Instruction &I : BB) {
+                                    if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                                        if (CI->getCalledFunction() == Callee) {
+                                            CriticalCallMap[F] = CI;
+                                            isStack = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (isStack) break;
+                            }
+                        }
+                        if (isStack) break;
+                    }
+                }
 
-		bool instrumentBlockWithExit(BasicBlock &BB, Module &M, Function &F, StringRef str = "") {
-			if (isa<UnreachableInst>(BB.getTerminator())) {
-				return false;
-			}
+                // Если функция сама содержит уязвимость, она тоже Stack (цель - уязвимый блок)
+                if (DirectlyVulnerableBlocksMap.count(F)) {
+                    isStack = true;
+                    // Для уязвимой функции целью является первая инструкция уязвимого блока
+                    if (!DirectlyVulnerableBlocksMap[F].empty()) {
+                        BasicBlock *VulnBB = *DirectlyVulnerableBlocksMap[F].begin();
+                        if (!VulnBB->empty()) {
+                            CriticalCallMap[F] = &*VulnBB->begin();
+                        }
+                    }
+                }
 
-			// Находим позицию для вставки: ПОСЛЕ всех PHI-нод
-			Instruction *InsertPos = &*BB.getFirstNonPHI();
-			// Если блок состоит ТОЛЬКО из PHI-нод — вставляем в конец
-			if (InsertPos == BB.getTerminator()) {
-				InsertPos = BB.getTerminator();
-			}
-			IRBuilder<> Builder(InsertPos);
-			FunctionCallee ExitFn = M.getOrInsertFunction("exit",
-				Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
-			Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
-			errs() << "Inserted exit(0) to" << str << F.getName() << "\n";
-			return true;
-		}
+                if (isStack) {
+                    StackFunctions.insert(F);
+                    errs() << "[" << F->getName() << "] " <<  "Stask function" << "\n";
+                } else {
+                    HelperFunctions.insert(F);
+                    errs() << "[" << F->getName() << "] " << "Helper function" << "\n";
+                }
+            }
+
+            // 4. Формируем план инструментации блоков
+            for (Function *F : preservedCluster) {
+                if (F->isDeclaration() || F->empty()) continue;
+
+                if (StackFunctions.count(F)) {
+                    // --- ЛОГИКА ДЛЯ STACK FUNCTION ---
+                    // Ищем блоки, не ведущие к Critical Call
+                    Instruction *Target = CriticalCallMap[F];
+                    if (Target) {
+                        std::set<Instruction*> Targets = {Target};
+                        std::set<BasicBlock*> NonLeadingBlocks = findBlocksNotLeadingToTargets(F, Targets);
+                        
+                        for (BasicBlock *BB : NonLeadingBlocks) {
+                            // errs() << "[&&&&&] " << BB->getName() << "' NonLeadingBlocks " << "\n";
+                            // Инструментируем только если блок завершается return или exit
+                            // if (isTerminatingBlock(BB, true)) { // true = check return
+                                plan.BlocksToWipeOut[F].insert(BB);
+                                printBlockTerminationTree(BB, "Stack Func: block does not lead to critical call and has return/exit");
+                            // }
+                        }
+                    }
+                } else if (HelperFunctions.count(F)) {
+                    // --- ЛОГИКА ДЛЯ HELPER FUNCTION ---
+                    // Инструментируем только блоки с exit/abort
+                    for (BasicBlock &BB : *F) {
+                        if (isTerminatingBlock(&BB, false)) { // false = ignore return, check only exit/abort
+                            plan.BlocksToWipeOut[F].insert(&BB);
+                            printBlockTerminationTree(&BB, "Helper Func: block contains exit/abort");
+                        }
+                    }
+                }
+            }
+
+            // Функции вне кластера глушим целиком
+            for (Function &F : M) {
+                if (F.isDeclaration() || F.empty()) continue;
+                if (preservedCluster.count(&F) == 0) {
+                    plan.FunctionsToWipeOut.insert(&F);
+                }
+            }
+
+            return plan;
+        }
 
 		bool runOnModule(Module &M) override {
 			loadConfig("vulnerabilities.cfg");
-
-			auto vulnInstrs = findVulnerableInstructions(M);
-			if (vulnInstrs.empty()) {
-				errs() << "No vulnerable instructions found\n";
+            findVulnerableFunctionsAndBlocks(M);
+            
+			if (DirectlyVulnerableBlocksMap.empty()) {
+				errs() << "[PASS] No vulnerable functions found.\n";
 				return false;
 			}
-			auto preserveFuncs = findFullPreserveSet(M, vulnInstrs);
-			auto calledFromPreserved = findFunctionsCalledFromPreserved(M, preserveFuncs);
-			dumpVulnerableFunctions(calledFromPreserved);
+			
+            InstrumentationPlan plan = buildInstrumentationPlan(M);
 
-			errs() << "Preserving functions:\n";
-			for (Function *F : preserveFuncs) {
-				errs() << "  " << F->getName() << "\n";
-			}
-
+            errs() << "\n--- EXECUTING PLAN ---\n";
 			bool changed = false;
-			for (Function &F : M) {
-				if (F.isDeclaration() || F.empty()) continue;
+            
+            // 1. Глушим функции целиком
+            for (Function *F : plan.FunctionsToWipeOut) {
+                errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
+                for (BasicBlock &BB : *F) {
+                    if (isa<UnreachableInst>(BB.getTerminator())) continue;
+                    Instruction *InsertPos = &*BB.getFirstNonPHI();
+                    if (InsertPos == BB.getTerminator()) InsertPos = BB.getTerminator();
+                    IRBuilder<> Builder(InsertPos);
+                    FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
+                    Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
+                    changed = true;
+                }
+            }
 
-				if (preserveFuncs.count(&F)) continue;
-				// if (F.getName() == "main") continue;
-				
-				// if (calledFromPreserved.count(&F)) { 
-				// 	continue; // Функция вызывается из релевантного контекста
-				// } else if (preserveFuncs.count(&F)) {
-				// 	// Если в функции есть нерелевантные ветки - инструментируем их
-				// 	auto relevantBlocks = findRelevantBlocksInFunction(F, vulnInstrs, preserveFuncs);
-				// 	for (BasicBlock &BB : F) {
-				// 		if (relevantBlocks.count(&BB)) continue;
-				// 		if (instrumentBlockWithExit(BB, M, F, " bloks in ")) changed = true;
-				// 	}
-				// // } else if (calledFromPreserved.count(&F)) { 
-				// // 	continue; // Функция вызывается из релевантного контекста
-				// } else {
-					// Если в функции нет нерелевантных веток - инструментируем всю функцию
-					for (BasicBlock &BB : F) {
-						if (instrumentBlockWithExit(BB, M, F, " ")) changed = true;
-					}
-				// }
-			}
+            // 2. Глушим конкретные блоки
+            for (auto &Entry : plan.BlocksToWipeOut) {
+                Function *F = Entry.first;
+                std::set<BasicBlock*> &Blocks = Entry.second;
+                if (!Blocks.empty()) {
+                    errs() << "[INSTRUMENT-BLOCKS] In " << F->getName() << " (" << Blocks.size() << " blocks)\n";
+                }
+                
+                for (BasicBlock *BB : Blocks) {
+                    if (isa<UnreachableInst>(BB->getTerminator())) continue;
+                    Instruction *InsertPos = &*BB->getFirstNonPHI();
+                    if (InsertPos == BB->getTerminator()) InsertPos = BB->getTerminator();
+                    IRBuilder<> Builder(InsertPos);
+                    FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
+                    Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
+                    changed = true;
+                }
+            }
 
+            if (changed) errs() << "[PASS] Instrumentation complete.\n";
 			return changed;
 		}
 	};
 }
 
 char VulnerablePathPass::ID = 0;
-
-static RegisterPass<VulnerablePathPass> X(
-	"vuln-path",
-	"Preserve only paths leading to vulnerabilities (block-level)",
-	false,
-	false);
+static RegisterPass<VulnerablePathPass> X("vuln-path", "Preserve only paths leading to vulnerabilities", false, false);
