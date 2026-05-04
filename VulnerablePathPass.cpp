@@ -101,6 +101,7 @@ namespace
 		static char ID;
 		std::unordered_map<std::string, std::vector<std::pair<std::string, unsigned>>> ConfigVulns;
         std::map<Function*, std::set<BasicBlock*>> DirectlyVulnerableBlocksMap;
+        FunctionCallee ExitFn;
 
 		VulnerablePathPass() : ModulePass(ID) {}
 
@@ -534,8 +535,24 @@ namespace
             return plan;
         }
 
+        void instrumentBlocks(Module &M, const std::set<BasicBlock*> &Blocks, bool &changed) {
+            if (Blocks.empty()) return;
+
+            for (BasicBlock *BB : Blocks) {
+                if (isa<UnreachableInst>(BB->getTerminator())) continue;
+                Instruction *InsertPos = &*BB->getFirstNonPHI();
+                if (InsertPos == BB->getTerminator()) {
+                    InsertPos = BB->getTerminator();
+                }
+                IRBuilder<> Builder(InsertPos);
+                Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
+                changed = true;
+            }
+        }
+
 		bool runOnModule(Module &M) override {
 			loadConfig("vulnerabilities.cfg");
+            ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
             findVulnerableFunctionsAndBlocks(M);
             
 			if (DirectlyVulnerableBlocksMap.empty()) {
@@ -551,34 +568,23 @@ namespace
             // 1. Инструментируем функции целиком
             for (Function *F : plan.FunctionsToWipeOut) {
                 errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
+                
+                std::set<BasicBlock*> AllBlocks;
                 for (BasicBlock &BB : *F) {
-                    if (isa<UnreachableInst>(BB.getTerminator())) continue;
-                    Instruction *InsertPos = &*BB.getFirstNonPHI();
-                    if (InsertPos == BB.getTerminator()) InsertPos = BB.getTerminator();
-                    IRBuilder<> Builder(InsertPos);
-                    FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
-                    Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
-                    changed = true;
+                    AllBlocks.insert(&BB);
                 }
+                instrumentBlocks(M, AllBlocks, changed);
             }
 
             // 2. Инструментируем конкретные блоки
             for (auto &Entry : plan.BlocksToWipeOut) {
                 Function *F = Entry.first;
                 std::set<BasicBlock*> &Blocks = Entry.second;
+                
                 if (!Blocks.empty()) {
                     errs() << "[INSTRUMENT-BLOCKS] In " << F->getName() << " (" << Blocks.size() << " blocks)\n";
                 }
-                
-                for (BasicBlock *BB : Blocks) {
-                    if (isa<UnreachableInst>(BB->getTerminator())) continue;
-                    Instruction *InsertPos = &*BB->getFirstNonPHI();
-                    if (InsertPos == BB->getTerminator()) InsertPos = BB->getTerminator();
-                    IRBuilder<> Builder(InsertPos);
-                    FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
-                    Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
-                    changed = true;
-                }
+                instrumentBlocks(M, Blocks, changed);
             }
 
             if (changed) errs() << "[PASS] Instrumentation complete.\n";
