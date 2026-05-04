@@ -34,7 +34,9 @@ int main() {
 }
 */
 
- // Транзитивные вызовы
+
+/*
+// Транзитивные вызовы
 
 #include <string.h>
 
@@ -72,6 +74,7 @@ int main(int argc, char** argv) {
     return 0;
 }
 
+*/
 
 /* // Косвенный вызов (Function Pointer)
 
@@ -114,3 +117,49 @@ int main() {
     return 0;
 }
 */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Глобальный флаг для отслеживания выполнения
+int reached_vuln = 0;
+int reached_post_vuln = 0;
+
+void vulnerable_func(char *input) {
+    if (input[0] == 'X') {
+        printf("Pre-vuln return\n");
+        return; 
+    }
+    char buf[10];
+    strcpy(buf, input); 
+    reached_vuln = 1;
+    printf("PrePrePrePrePre return\n");
+
+    if (input[1] == 'Y') {
+        printf("Post-vuln return\n");
+        reached_post_vuln = 1;
+        return;
+    }
+    
+    printf("Normal end\n");
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    
+    vulnerable_func(argv[1]);
+
+    if (reached_vuln) {
+        printf("SUCCESS: Vulnerability line was executed.\n");
+        if (reached_post_vuln) {
+            printf("SUCCESS: Post-vulnerability logic was executed.\n");
+        } else {
+            printf("INFO: Post-vulnerability logic was skipped (normal for some inputs).\n");
+        }
+    } else {
+        printf("FAIL: Vulnerability line was NOT executed (path blocked too early?).\n");
+    }
+
+    return 0;
+}

@@ -257,6 +257,36 @@ namespace
             return result;
         }
 
+        std::set<BasicBlock*> getReachableBlocks(BasicBlock *StartBlock, bool Direction) {
+            std::set<BasicBlock*> reachable;
+            std::queue<BasicBlock*> worklist;
+            
+            worklist.push(StartBlock);
+            reachable.insert(StartBlock);
+
+            while (!worklist.empty()) {
+                BasicBlock *Current = worklist.front();
+                worklist.pop();
+
+                if (Direction) {
+                    // Forward: идем по successor'ам
+                    for (auto Succ : successors(Current)) {
+                        if (reachable.insert(Succ).second) {
+                            worklist.push(Succ);
+                        }
+                    }
+                } else {
+                    // Backward: идем по predecessor'ам
+                    for (auto Pred : predecessors(Current)) {
+                        if (reachable.insert(Pred).second) {
+                            worklist.push(Pred);
+                        }
+                    }
+                }
+            }
+            return reachable;
+        }
+
         InstrumentationPlan buildInstrumentationPlan(Module &M) {
             InstrumentationPlan plan;
             
@@ -316,7 +346,18 @@ namespace
             for (Function *F : StackFunctions) {
                 helperQueue.push(F);
             }
-            preserveSpecificFunctions(M, helperQueue, HelperFunctions, {"xmlInitParserInternal", "xmlPosixStrdup", "xmlMemRead", "xmlSAX2SetDocumentLocator"}, "Helper");
+            preserveSpecificFunctions(M, helperQueue, HelperFunctions, {
+                "xmlInitParserInternal",
+                "xmlPosixStrdup",
+                "xmlMemRead",
+                "xmlSAX2SetDocumentLocator",
+                "endOfInput",
+                "xmlSAX2StartDocument",
+                "xmlSAX2StartElementNs",
+                "xmlSAX2EndElementNs",
+                "xmlSAX2EndDocument",
+                "xmlMemClose"},
+                "Helper");
 
             while (!helperQueue.empty()) {
                 Function *Curr = helperQueue.front(); helperQueue.pop();
@@ -379,14 +420,85 @@ namespace
                 }
 
                 if (Target) {
-                    std::set<Instruction*> Targets = {Target};
-                    std::set<BasicBlock*> NonLeadingBlocks = findBlocksNotLeadingToTargets(F, Targets);
+                    BasicBlock *TargetBlock = Target->getParent();
                     
-                    for (BasicBlock *BB : NonLeadingBlocks) {
-                        // Для стековых функций инструментируем любые блоки, не ведущие к цели
-                        // (так как они являются тупиковыми ветками, прерывающими путь к уязвимости)
-                        plan.BlocksToWipeOut[F].insert(BB);
-                        printBlockTerminationTree(BB, "Stack Func: block does not lead to critical target");
+                    // 1. Находим все блоки, которые лежат НА ПУТИ К цели (Backward)
+                    std::set<BasicBlock*> BlocksBefore = getReachableBlocks(TargetBlock, false);
+                    
+                    // 2. Находим все блоки, которые лежат ПОСЛЕ цели (Forward)
+                    std::set<BasicBlock*> BlocksAfter = getReachableBlocks(TargetBlock, true);
+                    
+                    // Объединяем их
+                    std::set<BasicBlock*> ProtectedBlocks;
+                    ProtectedBlocks.insert(BlocksBefore.begin(), BlocksBefore.end());
+                    ProtectedBlocks.insert(BlocksAfter.begin(), BlocksAfter.end());
+
+                    errs() << "[PLAN-STACK] " << F->getName() 
+                           << ": Protected blocks: " << ProtectedBlocks.size() << "\n";
+
+                    // 3. Ищем блоки для инструментации
+                    for (BasicBlock &BB : *F) {
+                        if (ProtectedBlocks.count(&BB)) {
+                            continue;
+                        }
+
+                        // Блок не защищен. Это "боковая" ветка.
+                        // Нам нужно понять, стоит ли её глушить.
+                        // Глушим, если она ведет к выходу из функции (return) или exit.
+                        
+                        Instruction *Term = BB.getTerminator();
+                        
+                        // Вариант А: Блок сам содержит return
+                        if (isa<ReturnInst>(Term)) {
+                             plan.BlocksToWipeOut[F].insert(&BB);
+                             printBlockTerminationTree(&BB, "Stack Func: Unprotected return block");
+                             continue;
+                        }
+
+                        // Вариант Б: Блок содержит exit/abort
+                        if (isTerminatingBlock(&BB, false)) {
+                             plan.BlocksToWipeOut[F].insert(&BB);
+                             printBlockTerminationTree(&BB, "Stack Func: Unprotected exit block");
+                             continue;
+                        }
+
+                        // Вариант В: Блок делает br на unprotected return или просто на exit path?
+                        // В нашем случае if.then делает br на return.
+                        // Если return защищен (так как он после уязвимости), то br на него из незащищенного блока
+                        // означает, что эта ветка прерывает путь к уязвимости.
+                        
+                        if (BranchInst *BI = dyn_cast<BranchInst>(Term)) {
+                            // Если это безусловный переход или все пути ведут в тупик/выход
+                            bool allSuccsAreExitOrProtectedReturn = true;
+                            
+                            // Эвристика: если блок имеет только одного successor, и этот successor - блок return,
+                            // и текущий блок не ведет к уязвимости (мы это уже знаем, т.к. его нет в Protected),
+                            // то это кандидат на глушение.
+                            
+                            // Но будьте осторожны: если br условный, нужно проверить обе ветки.
+                            
+                            // Для простоты: если блок не защищен, и он не ведет к уязвимости,
+                            // мы можем вставить exit В НАЧАЛО этого блока.
+                            // Это прервет выполнение здесь.
+                            
+                            // Давайте просто инструментировать ВСЕ незащищенные блоки, 
+                            // которые являются "листьями" или ведут к return.
+                            
+                            // Проверим, ведет ли блок к return-блоку функции
+                            bool leadsToReturn = false;
+                            for (unsigned i = 0; i < BI->getNumSuccessors(); ++i) {
+                                BasicBlock *Succ = BI->getSuccessor(i);
+                                // Если successor - это блок с именем "return" или содержащий ret
+                                if (Succ->getName().startswith("return") || isa<ReturnInst>(Succ->getTerminator())) {
+                                    leadsToReturn = true;
+                                }
+                            }
+                            
+                            if (leadsToReturn) {
+                                plan.BlocksToWipeOut[F].insert(&BB);
+                                printBlockTerminationTree(&BB, "Stack Func: Unprotected branch leading to return");
+                            }
+                        }
                     }
                 } else {
                     errs() << "[PLAN-STACK] " << F->getName() << " has no clear target. Preserving entirely.\n";
@@ -437,18 +549,18 @@ namespace
 			bool changed = false;
             
             // 1. Инструментируем функции целиком
-            for (Function *F : plan.FunctionsToWipeOut) {
-                errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
-                for (BasicBlock &BB : *F) {
-                    if (isa<UnreachableInst>(BB.getTerminator())) continue;
-                    Instruction *InsertPos = &*BB.getFirstNonPHI();
-                    if (InsertPos == BB.getTerminator()) InsertPos = BB.getTerminator();
-                    IRBuilder<> Builder(InsertPos);
-                    FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
-                    Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
-                    changed = true;
-                }
-            }
+            // for (Function *F : plan.FunctionsToWipeOut) {
+            //     errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
+            //     for (BasicBlock &BB : *F) {
+            //         if (isa<UnreachableInst>(BB.getTerminator())) continue;
+            //         Instruction *InsertPos = &*BB.getFirstNonPHI();
+            //         if (InsertPos == BB.getTerminator()) InsertPos = BB.getTerminator();
+            //         IRBuilder<> Builder(InsertPos);
+            //         FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
+            //         Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
+            //         changed = true;
+            //     }
+            // }
 
             // 2. Инструментируем конкретные блоки
             for (auto &Entry : plan.BlocksToWipeOut) {
