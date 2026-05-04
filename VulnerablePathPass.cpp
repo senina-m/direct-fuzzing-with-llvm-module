@@ -549,18 +549,18 @@ namespace
 			bool changed = false;
             
             // 1. Инструментируем функции целиком
-            // for (Function *F : plan.FunctionsToWipeOut) {
-            //     errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
-            //     for (BasicBlock &BB : *F) {
-            //         if (isa<UnreachableInst>(BB.getTerminator())) continue;
-            //         Instruction *InsertPos = &*BB.getFirstNonPHI();
-            //         if (InsertPos == BB.getTerminator()) InsertPos = BB.getTerminator();
-            //         IRBuilder<> Builder(InsertPos);
-            //         FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
-            //         Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
-            //         changed = true;
-            //     }
-            // }
+            for (Function *F : plan.FunctionsToWipeOut) {
+                errs() << "[INSTRUMENT-FUNC] " << F->getName() << "\n";
+                for (BasicBlock &BB : *F) {
+                    if (isa<UnreachableInst>(BB.getTerminator())) continue;
+                    Instruction *InsertPos = &*BB.getFirstNonPHI();
+                    if (InsertPos == BB.getTerminator()) InsertPos = BB.getTerminator();
+                    IRBuilder<> Builder(InsertPos);
+                    FunctionCallee ExitFn = M.getOrInsertFunction("exit", Type::getVoidTy(M.getContext()), Type::getInt32Ty(M.getContext()));
+                    Builder.CreateCall(ExitFn, {Builder.getInt32(0)});
+                    changed = true;
+                }
+            }
 
             // 2. Инструментируем конкретные блоки
             for (auto &Entry : plan.BlocksToWipeOut) {
