@@ -28,13 +28,13 @@ if_end4 --> return
 ' --- Вызовы внутри блоков ---
 note right of if_then
 if (argv[0] == "A")
-' <b>call exit(0)</b>
+ ' <b>call exit(0)</b>
   safe()
   return 0
 end note
 note left of if_then3
 if (argv[0] == "B")
-' <b>call exit(0)</b>
+ ' <b>call exit(0)</b>
   return 0
 end note
 note left of if_else

@@ -1,3 +1,74 @@
+#include <string.h>
+
+void do_something(char* data) {
+    data[0] = 0;
+}
+
+void inner(char *data) {
+    char buf[5];
+    do_something(buf);
+    strcpy(buf, data);
+}
+
+void middle(char *data) {
+    inner(data);
+}
+
+void outer() {
+    middle("exploit");
+}
+
+void safe() {
+    int x = 0;
+}
+
+int main(int argc, char** argv) {
+    if (argv[0] == "A") { safe(); return 0;}
+    if (argv[0] == "B") return 0;
+    else outer();
+    return 0;
+}
+
+/*  // Косвенный вызов (Function Pointer)
+
+#include <stdio.h>
+#include <string.h>
+
+void trigger_vulnerability(char *input) {
+    char buf[8];
+    strcpy(buf, input);
+}
+
+int main() {
+    char input[128] = {0};
+    if (fgets(input, sizeof(input), stdin) == NULL) return 0;
+
+    if (input[0] != 'A') return 0;
+    if (input[1] != 'B') input[1] = 'C';
+
+    trigger_vulnerability(input);
+    return 0;
+}
+
+*/
+
+/*
+void inner(char *data) {
+	char buf[5];
+	strcpy(buf, data); // уязвимость
+}
+
+void middle(char *data) { inner(data); }
+void outer() { middle("exploit"); }
+void safe() { int x = 0; }
+
+int main() {
+	outer();
+	safe();
+	return 0;
+}
+*/
+
 /* #include <stdio.h>
 #include <string.h>
 
@@ -76,29 +147,6 @@ int main(int argc, char** argv) {
 
 */
 
-/* // Косвенный вызов (Function Pointer)
-
-#include <stdio.h>
-#include <string.h>
-
-void trigger_vulnerability(char *input) {
-    char buf[8];
-    strcpy(buf, input);
-}
-
-int main() {
-    char input[128] = {0};
-    if (fgets(input, sizeof(input), stdin) == NULL) return 0;  // ← этот блок
-
-    if (input[0] != 'A') return 0;  // ← этот блок
-    if (input[1] != 'B') input[1] = 'C';
-
-    trigger_vulnerability(input);
-    return 0;
-}
-
- */
-
 
 /* //Косвенный вызов (Function Pointer) 
 typedef void (*callback_t)(int);
@@ -118,6 +166,7 @@ int main() {
 }
 */
 
+/*
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -163,3 +212,4 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+*/

@@ -528,9 +528,39 @@ namespace
                 }
             }
 
+            // --- Подсчет общих метрик модуля и инструментации ---
+            unsigned totalFunctions = 0;
+            unsigned totalBasicBlocks = 0;
+            unsigned totalInstrumentedBlocks = 0;
+
+            for (Function &F : M) {
+                if (F.isDeclaration()) continue;
+                
+                totalFunctions++;
+                totalBasicBlocks += F.size();
+
+                // 1. Считаем блоки в полностью инструментированных функциях
+                if (plan.FunctionsToWipeOut.count(&F)) {
+                    totalInstrumentedBlocks += F.size();
+                }
+            }
+
+            // 2. Добавляем блоки, инструментированные выборочно в сохраненных функциях
+            for (auto &Entry : plan.BlocksToWipeOut) {
+                totalInstrumentedBlocks += Entry.second.size();
+            }
+
+            // Вывод статистики
+            errs() << "[SUMMARY] Total Functions: " << totalFunctions 
+                   << ", Total Basic Blocks: " << totalBasicBlocks << "\n";
+            
             errs() << "[SUMMARY] Stack Functions: " << StackFunctions.size() 
                    << ", Helper Functions: " << HelperFunctions.size() 
                    << ", Wiped Functions: " << plan.FunctionsToWipeOut.size() << "\n";
+
+            errs() << "[SUMMARY] Total Instrumented Blocks: " << totalInstrumentedBlocks 
+                   << " (" << (totalBasicBlocks > 0 ? (float)totalInstrumentedBlocks / totalBasicBlocks * 100 : 0) 
+                   << "% of total blocks)\n";
 
             return plan;
         }
