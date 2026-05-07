@@ -1,0 +1,215 @@
+#include <string.h>
+
+void do_something(char* data) {
+    data[0] = 0;
+}
+
+void inner(char *data) {
+    char buf[5];
+    do_something(buf);
+    strcpy(buf, data);
+}
+
+void middle(char *data) {
+    inner(data);
+}
+
+void outer() {
+    middle("exploit");
+}
+
+void safe() {
+    int x = 0;
+}
+
+int main(int argc, char** argv) {
+    if (argv[0] == "A") { safe(); return 0;}
+    if (argv[0] == "B") return 0;
+    else outer();
+    return 0;
+}
+
+/*  // Косвенный вызов (Function Pointer)
+
+#include <stdio.h>
+#include <string.h>
+
+void trigger_vulnerability(char *input) {
+    char buf[8];
+    strcpy(buf, input);
+}
+
+int main() {
+    char input[128] = {0};
+    if (fgets(input, sizeof(input), stdin) == NULL) return 0;
+
+    if (input[0] != 'A') return 0;
+    if (input[1] != 'B') input[1] = 'C';
+
+    trigger_vulnerability(input);
+    return 0;
+}
+
+*/
+
+/*
+void inner(char *data) {
+	char buf[5];
+	strcpy(buf, data); // уязвимость
+}
+
+void middle(char *data) { inner(data); }
+void outer() { middle("exploit"); }
+void safe() { int x = 0; }
+
+int main() {
+	outer();
+	safe();
+	return 0;
+}
+*/
+
+/* #include <stdio.h>
+#include <string.h>
+
+int safe_func() {
+    return 2 + 1;
+}
+
+void vuln_func(char *input) {
+    char buf[16];
+    strcpy(buf, input);  // ← уязвимость
+}
+
+int main() {
+    char input[128] = {0};
+    if (!fgets(input, sizeof(input), stdin)) return 0;
+
+    for (int i = 0; i < 128; i++) {
+        if (input[i] == '\n') {
+            input[i] = '\0';
+            break;
+        }
+    }
+
+    if (input[0] == 'A') {
+        int y = safe_func();
+        if (y == 3){
+            return 0;
+        }
+    } else {
+        vuln_func(input);
+    }
+
+    return 0;
+}
+*/
+
+
+/*
+// Транзитивные вызовы
+
+#include <string.h>
+
+void do_something(char* data) {
+    data[0] = 0;
+}
+
+
+void inner(char *data) {
+    char buf[5];
+    do_something(buf);
+    strcpy(buf, data);  // уязвимость
+}
+
+void middle(char *data) {
+    inner(data);  // вызывает уязвимую
+}
+
+void outer() {
+    middle("exploit");  // вызывает middle
+}
+
+void safe() {
+    int x = 0;
+}
+
+int main(int argc, char** argv) {
+    // safe();
+    // if (argv[0] == "A") {char buf[5]; do_something(buf); return 0;}
+    // if (argv[0] == "B") { safe(); return 0;}
+    // if (argv[0] == 1) outer();
+    if (argv[0] == "A") return 0;
+    else inner("exploit");
+    // else safe();
+    return 0;
+}
+
+*/
+
+
+/* //Косвенный вызов (Function Pointer) 
+typedef void (*callback_t)(int);
+
+void vulnerable_func(int x) {
+    char buf[10];
+    strcpy(buf, "very_long_string"); // Уязвимость здесь
+}
+
+void safe_wrapper(callback_t cb) {
+    cb(10); // Косвенный вызов!
+}
+
+int main() {
+    safe_wrapper(vulnerable_func);
+    return 0;
+}
+*/
+
+/*
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Глобальный флаг для отслеживания выполнения
+int reached_vuln = 0;
+int reached_post_vuln = 0;
+
+void vulnerable_func(char *input) {
+    if (input[0] == 'X') {
+        printf("Pre-vuln return\n");
+        return; 
+    }
+    char buf[10];
+    strcpy(buf, input); 
+    reached_vuln = 1;
+    printf("PrePrePrePrePre return\n");
+
+    if (input[1] == 'Y') {
+        printf("Post-vuln return\n");
+        reached_post_vuln = 1;
+        return;
+    }
+    
+    printf("Normal end\n");
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    
+    vulnerable_func(argv[1]);
+
+    if (reached_vuln) {
+        printf("SUCCESS: Vulnerability line was executed.\n");
+        if (reached_post_vuln) {
+            printf("SUCCESS: Post-vulnerability logic was executed.\n");
+        } else {
+            printf("INFO: Post-vulnerability logic was skipped (normal for some inputs).\n");
+        }
+    } else {
+        printf("FAIL: Vulnerability line was NOT executed (path blocked too early?).\n");
+    }
+
+    return 0;
+}
+*/

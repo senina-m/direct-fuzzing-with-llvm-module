@@ -1,0 +1,68 @@
+@startuml
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultTextAlignment left
+
+' --- Базовые блоки main ---
+package "Базовые блоки main()" {
+rectangle "entry" as entry
+rectangle "if.then" as if_then
+rectangle "if.end" as if_end
+rectangle "if.then3" as if_then3
+rectangle "if.else" as if_else
+rectangle "if.end4" as if_end4
+rectangle "return" as return
+}
+' --- Поток управления ---
+
+entry --> if_then
+entry --> if_end
+if_then --> return
+if_end --> if_then3
+if_end --> if_else
+if_then3 --> return
+if_else --> if_end4
+if_end4 --> return
+
+
+' --- Вызовы внутри блоков ---
+note right of if_then
+if (argv[0] == "A")
+ <b>call exit(0)</b>
+  safe()
+  return 0
+end note
+note left of if_then3
+if (argv[0] == "B")
+ <b>call exit(0)</b>
+  return 0
+end note
+note left of if_else
+  outer()
+end note
+
+' --- Вызываемые функции ---
+package "Функции программы" {
+rectangle "main"
+rectangle "outer"
+rectangle "middle"
+rectangle "inner"
+rectangle "do_something"
+rectangle "strcpy"
+}
+
+main --> outer
+outer --> middle
+middle --> inner
+inner --> do_something
+inner --> strcpy
+
+note left of strcpy
+  <b>Уязвимость</b>
+  Переполнение буфера
+  strcpy(buf, data)
+  buf size: 5 bytes
+  data size: 8 bytes
+end note
+
+@enduml
